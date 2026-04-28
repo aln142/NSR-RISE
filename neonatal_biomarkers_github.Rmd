@@ -1,0 +1,443 @@
+---
+title: "HEAL EEG Biomarkers"
+author: ""
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: readable
+---
+
+<style>
+img { max-width: none; }
+</style>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 10,
+  fig.height = 6
+)
+
+rm(list = ls())
+gc()
+
+required_packages <- c(
+  "knitr", "ggplot2", "tableone", "corrplot", "PerformanceAnalytics",
+  "ggExtra", "EnvStats", "sandwich", "DescTools", "lmtest", "glmnet",
+  "mice", "pracma", "dotwhisker", "redcapAPI", "data.table",
+  "Hmisc", "dplyr", "writexl", "readxl", "REDCapR", "janitor",
+  "ggrepel", "pathfindR", "org.Hs.eg.db"
+)
+
+missing_packages <- required_packages[!required_packages %in% rownames(installed.packages())]
+if (length(missing_packages) > 0) {
+  message("Install missing packages before knitting: ", paste(missing_packages, collapse = ", "))
+}
+
+invisible(lapply(required_packages, require, character.only = TRUE))
+```
+
+# Notes
+
+This document is saved as HTML because some figures are too wide to fit on a PDF page. If figures do not render well in the browser, download the HTML file and open it locally.
+
+This GitHub version has been sanitized for public sharing:
+
+- REDCap API tokens have been removed.
+- Local file paths have been replaced with configurable paths.
+- Private identifiers and institution-specific paths should be reviewed before posting.
+- Raw data are not included in this repository.
+
+# Configuration
+
+Create a local `.Renviron` file, not committed to GitHub, containing:
+
+```bash
+REDCAP_URI="https://redcap.ucsf.edu/api/"
+REDCAP_TOKEN="your_redcap_token_here"
+```
+
+Set paths below to match your local environment. For GitHub, place de-identified input files under `data/` and generated outputs under `outputs/`.
+
+```{r config}
+paths <- list(
+  cytokine_file = "data/Cytokines_for_NSR_RISE.xlsx",
+  output_dir = "outputs"
+)
+
+if (!dir.exists(paths$output_dir)) {
+  dir.create(paths$output_dir, recursive = TRUE)
+}
+
+redcap_uri <- Sys.getenv("REDCAP_URI")
+redcap_token <- Sys.getenv("REDCAP_TOKEN")
+```
+
+# Data processing
+
+We identified three samples with unusual biomarker readings that may have been urine samples instead of blood. Those three samples, the second samples for CLA-101, CLA-201, and PIT-113, were removed from this analysis.
+
+For biomarker concentrations reported as thresholds, for example `< some value`, the threshold was used as the value.
+
+These analyses were updated with the re-run tau measurements.
+
+Throughout, biomarkers are ordered and grouped as follows:
+
+- Brain-specific proteins: GFAP, NSE, S100B, UCH-L1, Tau
+- Other growth factors: BDNF, EPO, NCAM1/CD56, NRG1β, VEGF
+- Pro-inflammatory cytokines, chemokines, and peptides: C5a, Fractalkine/CXCL1, ICAM1/CD54, IFN-γ, IL-1β, IL-6, IL-12p70, IL-17A, MCP-1/CCL2, MIP-1α/CCL3, MIP-1β/CCL4, VCAM1/CD106
+- Anti-inflammatory cytokines: IL-1RA, IL-8, IL-10, IL-13, IL-33
+
+```{r import-data, eval=FALSE}
+# Option A: Export directly from REDCap.
+# Do not hard-code REDCap tokens in this file.
+
+if (redcap_uri == "" || redcap_token == "") {
+  stop("Set REDCAP_URI and REDCAP_TOKEN in your local .Renviron file.")
+}
+
+rcon <- redcapConnection(url = redcap_uri, token = redcap_token)
+
+derived.data <- exportRecordsTyped(
+  rcon,
+  fields = NULL,
+  forms = NULL,
+  records = NULL,
+  events = NULL,
+  labels = TRUE,
+  dates = TRUE,
+  survey = TRUE,
+  checkboxLabels = FALSE,
+  factors = FALSE
+)
+
+cytokines <- readxl::read_excel(paths$cytokine_file, na = ".")
+derived.data <- merge(derived.data, cytokines, by = "study_id", all = TRUE)
+```
+
+```{r import-from-local, eval=FALSE}
+# Option B: Load a de-identified RDS exported from REDCap.
+# This is preferred for public GitHub workflows.
+
+derived.data <- readRDS("data/derived_data_deidentified.rds")
+cytokines <- readxl::read_excel(paths$cytokine_file, na = ".")
+derived.data <- merge(derived.data, cytokines, by = "study_id", all = TRUE)
+```
+
+# Variable derivation
+
+```{r variable-derivation, eval=FALSE}
+# Preserve one study ID with missing blood volume that was known to be valid.
+derived.data.extra <- subset(derived.data, study_id == "02308")
+derived.data <- subset(derived.data, vol_blood != "NA")
+derived.data <- bind_rows(derived.data, derived.data.extra)
+
+# Exclude participants excluded at 24 months.
+derived.data <- subset(derived.data, final_24_excluded != "Yes" | is.na(final_24_excluded))
+
+# Participant type.
+derived.data$patient_type <- as.factor(derived.data$patient_type)
+levels(derived.data$patient_type) <- list("Cases" = c("Acute"), "Controls" = c("Control"))
+
+# Demographics and clinical variables for Table 1.
+derived.data$`Maternal race` <- as.factor(derived.data$race)
+levels(derived.data$`Maternal race`) <- list(
+  "White" = c("White"),
+  "Black" = c("Black / African American"),
+  "Asian" = c("Asian"),
+  "Multiple/Other/Unknown" = c(
+    "American Indian / Alaska Native",
+    "Native Hawaiian / Other Pacific Islander",
+    "Other",
+    "Moret than one race",
+    "Unknown / Not Reported",
+    "Decline to Answer"
+  )
+)
+
+derived.data$`Maternal ethnicity` <- as.factor(derived.data$ethnicity)
+levels(derived.data$`Maternal ethnicity`) <- list(
+  "No/not reported" = c("NOT Hispanic or Latino", "Unknown / Not reported"),
+  "Yes" = c("Hispanic or Latino")
+)
+
+derived.data$`Maternal education` <- as.factor(derived.data$maternal_edu)
+levels(derived.data$`Maternal education`) <- list(
+  "At least some college or not reported" = c("College graduate", "Graduate study", "Unknown/Unavailable", "Decline to Answer"),
+  "High school or less" = c("High school graduate", "Some education, high school not complete")
+)
+
+derived.data$`Insurance Type` <- as.factor(derived.data$insurance_type)
+levels(derived.data$`Insurance Type`) <- list(
+  "Private" = c("Private"),
+  "Public" = c("Public", "Unknown", "Decline to Answer", "None")
+)
+
+derived.data <- derived.data %>%
+  mutate(`Maternal chorioamnionitis` = case_when(
+    maternal_fever == "No Fever" ~ "No",
+    maternal_fever %in% c(
+      "Fever > 39C (102.2F) once",
+      "Fever > 38C (100.4F) to 38.9C (102.0F) on two occasions"
+    ) ~ "Yes",
+    TRUE ~ NA_character_
+  ))
+
+derived.data$`Cesarean section delivery` <- as.factor(derived.data$delivery_mode)
+levels(derived.data$`Cesarean section delivery`) <- list(
+  "No" = c("Vaginal"),
+  "Yes" = c("Operative vaginal (vacuum or forceps)", "Scheduled cesarean section", "Emergent cesarean section")
+)
+
+derived.data$`Birth location` <- as.factor(derived.data$location)
+levels(derived.data$`Birth location`) <- list(
+  "Inborn" = c("Study center inpatient ward or ICU", "Study center L&D or well baby nursery"),
+  "Other hospital/other" = c("Referral center L&D, well baby nursery, or ICU", "Home")
+)
+
+derived.data$Sex <- as.factor(derived.data$gender)
+levels(derived.data$Sex) <- list("Male" = c("Male"), "Female" = c("Female"))
+
+derived.data$`Birth weight, g` <- as.numeric(derived.data$birth_weight)
+derived.data$`Gestational age at birth, wk` <- as.numeric(derived.data$gest_age)
+derived.data$`5 min Apgar` <- as.numeric(derived.data$apgar_5min)
+derived.data$`10 min Apgar` <- as.numeric(derived.data$apgar_10min)
+derived.data$`Gestational age at neonatal blood draw, wk` <- as.numeric(derived.data$postmens_age_neobd)
+```
+
+# Biomarker naming and ordering
+
+```{r biomarker-names, eval=FALSE}
+# Rename raw biomarker columns to analysis-friendly names.
+# Keep this block synchronized with the input assay file.
+
+data.table::setnames(
+  derived.data,
+  old = c(
+    'hGFAP1','Tau1','Fractalkine1','IFNy1','IL-101','IL-12(p70)1','IL-131','IL-17A1','IL-1b1',
+    'IL-211','IL-231','IL-41','IL-51','IL-61','IL-81','MIP-1a1','MIP-1b1','TNFa1','BDNF1',
+    'CCL2/JE/MCP-11','Complement Component C5a1','Enolase 2/Neuron-specific Enolase1','Growth Hormone1',
+    'ICAM-1/CD541','IL-1ra/IL-1F31','IL-331','NCAM-1/CD561','Neuregulin-1 beta 1/NRG1 beta 11',
+    'S100B1','UCH-L1/PGP9.51','VCAM-1/CD1061','VEGF1'
+  ),
+  new = c(
+    'GFAP1','TAU1','CX3CL1/Fractalkine1','IFN-g1','IL-101','IL-12p701','IL-131','IL-171','IL-1b1',
+    'IL-211','IL-231','IL-41','IL-51','IL-61','IL-81','CCL3/MIP-1a1','CCL4/MIP-1b1','TNF-a1',
+    'BDNF1','CCL2/MCP11','C5a1','NSE1','GH1','CD54/ICAM-11','IL-1RA1','IL-331','CD56/NCAM11',
+    'NGB1','s100b1','UCHL11','CD106/VCAM-11','VEGF1'
+  ),
+  skip_absent = TRUE
+)
+
+biomarker_names_brain_specific_proteins <- c("GFAP1", "s100b1", "UCHL11", "TAU1")
+biomarker_names_other_growth_factors <- c("BDNF1", "CD56/NCAM11", "GH1", "NGB1", "NSE1", "VEGF1")
+biomarker_names_pro_inflammatory <- c(
+  "C5a1", "CX3CL1/Fractalkine1", "CD54/ICAM-11", "IFN-g1", "IL-1b1", "IL-41", "IL-51",
+  "IL-61", "IL-81", "IL-12p701", "IL-171", "IL-211", "IL-231", "CCL2/MCP11", "CCL3/MIP-1a1",
+  "CCL4/MIP-1b1", "CD106/VCAM-11", "TNF-a1"
+)
+biomarker_names_anti_inflammatory <- c("IL-1RA1", "IL-101", "IL-131", "IL-331")
+
+biomarker_names <- c(
+  biomarker_names_anti_inflammatory,
+  biomarker_names_pro_inflammatory,
+  biomarker_names_brain_specific_proteins,
+  biomarker_names_other_growth_factors
+)
+
+biomarker_names_core <- unique(substr(biomarker_names, 1, nchar(biomarker_names) - 1))
+```
+
+# Cohort tables
+
+```{r cohort-tables, eval=FALSE}
+table_3_vars <- c(
+  "Maternal race", "Maternal ethnicity", "Maternal education", "Insurance Type",
+  "Maternal chorioamnionitis", "Cesarean section delivery", "Birth location", "Sex",
+  "Birth weight, g", "Gestational age at birth, wk", "Gestational age at neonatal blood draw, wk",
+  "5 min Apgar", "10 min Apgar", "Seizure Etiology", "Worst EEG Background",
+  "Days of EEG Seizures", "Therapeutic Hypothermia", "Abnormal Neurologic Exam at Discharge",
+  "CP", "WIDEA", "Services"
+)
+
+analysis.data <- derived.data %>%
+  filter(!is.na(Epilepsy))
+
+table_3 <- CreateTableOne(
+  data = analysis.data,
+  vars = table_3_vars,
+  strata = "Epilepsy",
+  test = TRUE,
+  addOverall = TRUE
+)
+
+table_3_print <- print(
+  table_3,
+  showAllLevels = FALSE,
+  missing = FALSE,
+  nonnormal = c("5 min Apgar", "10 min Apgar", "Gestational age at neonatal blood draw, wk")
+)
+
+knitr::kable(table_3_print, caption = "Cohort characteristics by epilepsy outcome")
+```
+
+# Missing data
+
+```{r missing-data, eval=FALSE}
+biomarker.data$number_biomarker <- rowSums(!is.na(biomarker.data[, biomarker_names]))
+
+table_missing_people <- data.frame(table(biomarker.data$number_biomarker))
+colnames(table_missing_people) <- c("Number of measures", "Number of participants")
+knitr::kable(table_missing_people, caption = "Number of biomarker measures available for participants")
+```
+
+# Primary biomarker analysis
+
+```{r primary-biomarker-analysis, eval=FALSE}
+manual_winsorize <- function(x, lower = 0.025, upper = 0.975) {
+  qnt <- quantile(x, probs = c(lower, upper), na.rm = TRUE)
+  ifelse(x < qnt[1], qnt[1], ifelse(x > qnt[2], qnt[2], x))
+}
+
+analysis.data$epilepsy <- ifelse(analysis.data$Epilepsy == 1, 1, 0)
+
+primary_df <- data.frame(
+  biomarker = biomarker_names,
+  median_no = NA_real_,
+  iqr_no = NA_real_,
+  median_yes = NA_real_,
+  iqr_yes = NA_real_,
+  rr = NA_real_,
+  rr_ci_lower = NA_real_,
+  rr_ci_upper = NA_real_,
+  rr_p = NA_real_
+)
+
+primary_df$biomarker_name <- substr(primary_df$biomarker, 1, nchar(primary_df$biomarker) - 1)
+primary_df$sample <- substr(primary_df$biomarker, nchar(primary_df$biomarker), nchar(primary_df$biomarker))
+cutoff <- qnorm(1.95 / 2)
+
+for (i in seq_len(nrow(primary_df))) {
+  biomarker.i <- primary_df$biomarker[i]
+
+  primary_df$median_no[i] <- median(analysis.data[analysis.data$epilepsy == 0, biomarker.i], na.rm = TRUE)
+  primary_df$iqr_no[i] <- IQR(analysis.data[analysis.data$epilepsy == 0, biomarker.i], na.rm = TRUE)
+  primary_df$median_yes[i] <- median(analysis.data[analysis.data$epilepsy == 1, biomarker.i], na.rm = TRUE)
+  primary_df$iqr_yes[i] <- IQR(analysis.data[analysis.data$epilepsy == 1, biomarker.i], na.rm = TRUE)
+
+  analysis.data$predictor.i <- log2(analysis.data[, biomarker.i])
+  model.i <- glm(epilepsy ~ predictor.i, family = poisson, data = analysis.data)
+
+  cov.model.i <- sandwich::vcovHC(model.i, type = "HC0")
+  std.err.i <- sqrt(diag(cov.model.i))["predictor.i"]
+
+  primary_df$rr[i] <- exp(coef(model.i)["predictor.i"])
+  primary_df$rr_ci_lower[i] <- exp(coef(model.i)["predictor.i"] - cutoff * std.err.i)
+  primary_df$rr_ci_upper[i] <- exp(coef(model.i)["predictor.i"] + cutoff * std.err.i)
+  primary_df$rr_p[i] <- lmtest::coeftest(model.i, vcov = cov.model.i)["predictor.i", "Pr(>|z|)"]
+}
+
+primary_df <- primary_df %>%
+  mutate(
+    p_fdr = p.adjust(rr_p, method = "fdr"),
+    fold_change = median_yes / median_no,
+    log2_fc = log2(fold_change)
+  )
+
+knitr::kable(primary_df, caption = "Primary biomarker associations with epilepsy")
+```
+
+# Manhattan plot
+
+```{r manhattan-plot, eval=FALSE}
+primary_df <- primary_df %>%
+  mutate(
+    category = case_when(
+      biomarker_name %in% substr(biomarker_names_brain_specific_proteins, 1, nchar(biomarker_names_brain_specific_proteins) - 1) ~ "Brain-specific proteins",
+      biomarker_name %in% substr(biomarker_names_other_growth_factors, 1, nchar(biomarker_names_other_growth_factors) - 1) ~ "Other growth factors",
+      biomarker_name %in% substr(biomarker_names_pro_inflammatory, 1, nchar(biomarker_names_pro_inflammatory) - 1) ~ "Pro-inflammatory cytokines, chemokines, and peptides",
+      biomarker_name %in% substr(biomarker_names_anti_inflammatory, 1, nchar(biomarker_names_anti_inflammatory) - 1) ~ "Anti-inflammatory cytokines",
+      TRUE ~ "Other"
+    ),
+    neg_log10_fdr = -log10(p_fdr)
+  )
+
+manhattan_plot <- ggplot(primary_df, aes(x = factor(biomarker_name, levels = unique(biomarker_name)), y = neg_log10_fdr, color = category)) +
+  geom_point(stroke = 1.5) +
+  theme_bw() +
+  theme(
+    text = element_text(size = 16),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    axis.title.y = element_text(size = 18.5, face = "bold"),
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)
+  ) +
+  labs(y = expression("FDR-adjusted p-value " ~ (-log[10] * " scale")), x = "")
+
+manhattan_plot
+
+ggsave(
+  filename = file.path(paths$output_dir, "manhattan_plot_RISE.png"),
+  plot = manhattan_plot,
+  width = 12,
+  height = 6,
+  dpi = 600
+)
+```
+
+# Volcano plot
+
+```{r volcano-plot, eval=FALSE}
+volcano_df <- primary_df %>%
+  mutate(
+    gene_type = case_when(
+      fold_change >= 1.24 & p_fdr <= 0.05 ~ "up",
+      fold_change <= 0.75 & p_fdr <= 0.05 ~ "down",
+      TRUE ~ "ns"
+    ),
+    delabel = if_else(gene_type != "ns", biomarker_name, NA_character_)
+  )
+
+volcano_plot <- ggplot(volcano_df, aes(x = log2_fc, y = -log10(p_fdr), fill = gene_type, label = delabel)) +
+  geom_point(shape = 21, color = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", linewidth = 0.4) +
+  geom_vline(xintercept = c(log2(0.75), log2(1.25)), linetype = "dashed", linewidth = 0.2) +
+  ggrepel::geom_text_repel(size = 3, max.overlaps = Inf) +
+  theme_bw() +
+  labs(x = expression(log[2]("fold change")), y = expression("FDR-adjusted p-value " ~ (-log[10] * " scale")))
+
+volcano_plot
+
+ggsave(
+  filename = file.path(paths$output_dir, "volcano_RISE.png"),
+  plot = volcano_plot,
+  width = 6,
+  height = 3,
+  dpi = 600
+)
+```
+
+# Protein pathway analysis
+
+```{r protein-pathway-analysis, eval=FALSE}
+pathway_input <- primary_df %>%
+  transmute(
+    Gene_symbol = biomarker_name,
+    log2FC = log2_fc,
+    P.Value = rr_p
+  )
+
+pathway_output <- pathfindR::run_pathfindR(pathway_input, pin_name_path = "KEGG")
+pathfindR::enrichment_chart(pathway_output, top_terms = 10)
+```
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```
